@@ -2,7 +2,7 @@
 
   <PropertyGroup>
     <OutputType>Library</OutputType>
-    <TargetFrameworks>netstandard2.0;net5.0;net8.0</TargetFrameworks>
+    <TargetFramework>net8.0</TargetFramework>
     <LangVersion>latest</LangVersion>
     <RootNamespace>WTelegram</RootNamespace>
     <Deterministic>true</Deterministic>
@@ -12,8 +12,8 @@
     <EmbedUntrackedSources>true</EmbedUntrackedSources>
     <PackageId>WTelegramClient</PackageId>
     <Authors>Wizou</Authors>
-    <VersionPrefix>0.0.0</VersionPrefix>
-    <VersionSuffix>layer.229</VersionSuffix>
+    <!-- Local reCAPTCHA fix; upstream 187c773a8f875db9f4f76e0778a33d025c0b70a1. See ../PATCHES.md. -->
+    <VersionPrefix>4.4.9</VersionPrefix>
     <Description>Telegram Client API (MTProto) library written 100% in C# and .NET Standard | Latest API layer: 229
 
 Release Notes:
@@ -48,7 +48,8 @@ $(ReleaseNotes)</Description>
   </ItemGroup>-->
 
   <ItemGroup Condition="$(DefineConstants.Contains('MTPG'))">
-    <ProjectReference Include="..\generator\MTProtoGenerator.csproj" OutputItemType="Analyzer" PrivateAssets="All" />
+    <ProjectReference Include="..\generator\MTProtoGenerator.csproj" OutputItemType="Analyzer" PrivateAssets="All"
+                      GlobalPropertiesToRemove="PublishAot;PublishTrimmed;PublishSingleFile;SelfContained;RuntimeIdentifier" />
   </ItemGroup>
 
   <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0'">

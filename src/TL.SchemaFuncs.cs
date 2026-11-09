@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Threading.Tasks;
 using TL.Methods;
 using Client = WTelegram.Client;
@@ -161,7 +161,6 @@ namespace TL
 		public static Task<Auth_AuthorizationBase> Auth_SignUp(this Client client, string phone_number, string phone_code_hash, string first_name, string last_name, bool no_joined_notifications = false)
 			=> client.Invoke(new Auth_SignUp
 			{
-				flags = (Auth_SignUp.Flags)(no_joined_notifications ? 0x1 : 0),
 				phone_number = phone_number,
 				phone_code_hash = phone_code_hash,
 				first_name = first_name,
@@ -9118,19 +9117,13 @@ namespace TL.Methods
 		public CodeSettings settings;
 	}
 
-	[TLDef(0xAAC7B717)]
+	[TLDef(0x80EEE427)]
 	public sealed partial class Auth_SignUp : IMethod<Auth_AuthorizationBase>
 	{
-		public Flags flags;
 		public string phone_number;
 		public string phone_code_hash;
 		public string first_name;
 		public string last_name;
-
-		[Flags] public enum Flags : uint
-		{
-			no_joined_notifications = 0x1,
-		}
 	}
 
 	[TLDef(0x8D52A951)]

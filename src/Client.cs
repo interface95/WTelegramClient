@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -57,6 +57,8 @@ namespace WTelegram
 		public bool Disconnected => _tcpClient != null && !(_tcpClient.Client?.Connected ?? false);
 		/// <summary>ID of the current logged-in user or 0</summary>
 		public long UserId => _session.UserId;
+		/// <summary>API ID stored in this session and used for Telegram requests.</summary>
+		public int ApiId => _session.ApiId;
 		/// <summary>Info about the current logged-in user. This is only filled after a successful (re)login, not updated later</summary>
 		public User User { get; private set; }
 		/// <summary>Number of parallel transfers operations (uploads/downloads) allowed at the same time.</summary>
@@ -85,6 +87,9 @@ namespace WTelegram
 		private readonly List<long> _msgsToAck = [];
 		private readonly Random _random = new();
 		private int _saltChangeCounter;
+		private Task _futureSaltsTask = Task.CompletedTask;
+		private object _futureSaltsOperation;
+		private Session.DCSession _futureSaltsSession;
 		private Task _reactorTask;
 		private Rpc _bareRpc;
 		private readonly Dictionary<long, Rpc> _pendingRpcs = [];
@@ -102,6 +107,8 @@ namespace WTelegram
 		private AesCtr _sendCtr, _recvCtr;
 #endif
 		private bool _paddedMode;
+		private bool _abridgedMode;
+		internal long LastRecvMsgId => _lastRecvMsgId;
 
 		public Client(int apiID, string apiHash, string sessionPathname = null)
 			: this(what => what switch
@@ -155,11 +162,7 @@ namespace WTelegram
 			"session_pathname" => Path.Combine(
 				Path.GetDirectoryName(Path.GetDirectoryName(AppDomain.CurrentDomain.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar)))
 				?? AppDomain.CurrentDomain.BaseDirectory, "WTelegram.session"),
-#if DEBUG
-			"server_address" => "2>149.154.167.40:443",	// Test DC 2
-#else
-			"server_address" => "2>149.154.167.50:443",	// DC 2
-#endif
+			"server_address" => "2>149.154.167.50:443",	// Production DC 2; use the config callback for test DCs.
 			"device_model" => Environment.Is64BitOperatingSystem ? "PC 64bit" : "PC 32bit",
 			"system_version" => Helpers.GetSystemVersion(),
 			"app_version" => Helpers.GetAppVersion(),
@@ -237,7 +240,14 @@ namespace WTelegram
 					await SendAsync(msgsAck, false).WaitAsync(1000).ConfigureAwait(false);
 			}
 			catch { }
-			_cts?.Cancel();
+			lock (_session)
+			{
+				// Invalidate ownership before a reconnect can schedule another refresh for the same DC.
+				_futureSaltsOperation = null;
+				_futureSaltsSession?.Salts?.Remove(DateTime.MaxValue);
+				_futureSaltsSession = null;
+				_cts?.Cancel();
+			}
 			_sendSemaphore = new(0);    // initially taken, first released during DoConnectAsync
 			try
 			{
@@ -252,6 +262,7 @@ namespace WTelegram
 			_recvCtr?.Dispose();
 #endif
 			_paddedMode = false;
+			_abridgedMode = false;
 			_connecting = null;
 			_bareRpc = null;
 			if (resetSessions)
@@ -351,12 +362,47 @@ namespace WTelegram
 				IObject obj = null;
 				try
 				{
-					if (await stream.FullReadAsync(data, 4, ct) != 4)
-						throw new WTException(ConnectionShutDown);
+					int payloadLen;
+					if (_abridgedMode)
+					{
+						if (await stream.FullReadAsync(data, 1, ct) != 1)
+							throw new WTException(ConnectionShutDown);
 #if OBFUSCATION
-					_recvCtr.EncryptDecrypt(data.AsSpan(0, 4));
+						_recvCtr.EncryptDecrypt(data.AsSpan(0, 1));
 #endif
-					int payloadLen = BinaryPrimitives.ReadInt32LittleEndian(data);
+						byte fByte = data[0];
+						if ((fByte & 0x80) != 0)
+						{
+							if (await stream.FullReadAsync(data, 3, ct) != 3)
+								throw new WTException(ConnectionShutDown);
+#if OBFUSCATION
+							_recvCtr.EncryptDecrypt(data.AsSpan(0, 3));
+#endif
+							continue;
+						}
+						if (fByte != 0x7F)
+						{
+							payloadLen = fByte << 2;
+						}
+						else
+						{
+							if (await stream.FullReadAsync(data, 3, ct) != 3)
+								throw new WTException(ConnectionShutDown);
+#if OBFUSCATION
+							_recvCtr.EncryptDecrypt(data.AsSpan(0, 3));
+#endif
+							payloadLen = (data[0] | (data[1] << 8) | (data[2] << 16)) << 2;
+						}
+					}
+					else
+					{
+						if (await stream.FullReadAsync(data, 4, ct) != 4)
+							throw new WTException(ConnectionShutDown);
+#if OBFUSCATION
+						_recvCtr.EncryptDecrypt(data.AsSpan(0, 4));
+#endif
+						payloadLen = BinaryPrimitives.ReadInt32LittleEndian(data);
+					}
 					if (payloadLen <= 0)
 						throw new WTException("Could not read frame data : Invalid payload length");
 					else if (payloadLen > data.Length)
@@ -427,7 +473,11 @@ namespace WTelegram
 					}
 				}
 				if (obj != null)
+				{
 					await HandleMessageAsync(obj);
+					if (_session.ApiId is 4 or 6 && _dcSession.authKeyID != 0 && _httpWait == null && CheckMsgsToAck() is MsgsAck postRecvAck)
+						_ = SendAsync(postRecvAck, false, connectionToken: ct);
+				}
 			}
 		}
 
@@ -555,32 +605,109 @@ namespace WTelegram
 		{
 			lock (_session)
 			{
+				if (_cts == null || _cts.IsCancellationRequested) return;
 				_dcSession.Salts ??= [];
+				if (_futureSaltsOperation != null && ReferenceEquals(_futureSaltsSession, _dcSession)) return;
+				// Another session save may have persisted the marker before its connection was closed.
+				_dcSession.Salts.Remove(DateTime.MaxValue);
+				if (_session.ApiId is 4 or 6 && _dcSession.Salts.Count == 0 && _dcSession.Salt != 0)
+				{
+					var initialValidUntil = DateTime.UtcNow.AddTicks(_dcSession.serverTicksOffset).AddMinutes(25);
+					_dcSession.Salts[initialValidUntil] = _dcSession.Salt;
+					return;
+				}
 				if (_dcSession.Salts.Count != 0)
 				{
 					var keys = _dcSession.Salts.Keys;
-					if (keys[^1] == DateTime.MaxValue) return; // GetFutureSalts ongoing
 					var now = DateTime.UtcNow.AddTicks(_dcSession.serverTicksOffset - TimeSpan.TicksPerMinute);
 					bool removed = false;
 					for (; keys.Count > 1 && keys[1] < now; _dcSession.OldSalt = _dcSession.Salt, _dcSession.Salt = _dcSession.Salts.Values[0], removed = true)
 						_dcSession.Salts.RemoveAt(0);
 					if (removed) _session.Save();
-					if (_dcSession.Salts.Count > 48) return;
+					if (_dcSession.Salts.Count > 48 || (_session.ApiId is 4 or 6 && keys[0] > now)) return;
 				}
 				_dcSession.Salts[DateTime.MaxValue] = 0;
+				_futureSaltsSession = _dcSession;
+				_futureSaltsOperation = new object();
+				_futureSaltsTask = RefreshFutureSaltsAsync(_dcSession, _cts.Token, _futureSaltsOperation);
 			}
-			Task.Delay(5000).ContinueWith(_ => this.GetFutureSalts(128).ContinueWith(gfs =>
+		}
+
+		private async Task RefreshFutureSaltsAsync(Session.DCSession dcSession, CancellationToken connectionToken, object operation)
+		{
+			Rpc rpc = null;
+			try
 			{
+				await Task.Delay(5000, connectionToken).ConfigureAwait(false);
+				rpc = new Rpc { type = typeof(FutureSalts) };
+				var responseTask = ObserveFutureSaltsResponseAsync(rpc, dcSession.DcID);
+				// This maintenance request belongs to this connection; it must never migrate or retry on a new one.
+				int numSalts = _session.ApiId is 4 or 6 ? 32 : 128;
+				await SendAsync(new TL.Methods.GetFutureSalts { num = numSalts }, true, rpc, connectionToken).ConfigureAwait(false);
+				while (_httpClient != null && !rpc.Task.IsCompleted)
+					await HttpWaitAsync(_httpWait, connectionToken).ConfigureAwait(false);
+				var result = await responseTask.WaitAsync(connectionToken).ConfigureAwait(false);
+				if (result == null) return; // The response observer has already logged a transport/decoding failure.
+				if (result is RpcError error)
+					throw new RpcException(error.error_code, error.error_message);
+				if (result is ReactorError reactorError)
+					throw new WTException("Connection failed while refreshing future salts", reactorError.Exception);
+				if (result is not FutureSalts futureSalts)
+					throw new WTException($"GetFutureSalts got an unexpected {result.GetType().Name} response");
 				lock (_session)
 				{
-					_dcSession.Salts.Remove(DateTime.MaxValue);
-					foreach (var entry in gfs.Result.salts)
-						_dcSession.Salts[entry.valid_since] = entry.salt;
-					_dcSession.OldSalt = _dcSession.Salt;
-					_dcSession.Salt = _dcSession.Salts.Values[0];
+					if (connectionToken.IsCancellationRequested || !ReferenceEquals(_futureSaltsOperation, operation)
+						|| !ReferenceEquals(_dcSession, dcSession)) return;
+					dcSession.Salts.Remove(DateTime.MaxValue);
+					foreach (var entry in futureSalts.salts)
+						dcSession.Salts[entry.valid_since] = entry.salt;
+					if (dcSession.Salts.Count != 0)
+					{
+						dcSession.OldSalt = dcSession.Salt;
+						dcSession.Salt = dcSession.Salts.Values[0];
+					}
 					_session.Save();
 				}
-			}));
+			}
+			catch (OperationCanceledException) when (connectionToken.IsCancellationRequested) { }
+			catch (Exception ex)
+			{
+				Helpers.Log(4, $"{dcSession.DcID}>Could not refresh future salts: {ex}");
+			}
+			finally
+			{
+				if (rpc != null)
+					lock (_pendingRpcs)
+					{
+						// A receiver that already pulled this RPC owns completion; its result is still observed above.
+						if (rpc.msgId == 0 || _pendingRpcs.TryGetValue(rpc.msgId, out var pending) && ReferenceEquals(pending, rpc))
+						{
+							_pendingRpcs.Remove(rpc.msgId);
+							rpc.tcs.TrySetResult(null);
+						}
+					}
+				lock (_session)
+					if (ReferenceEquals(_futureSaltsOperation, operation))
+					{
+						dcSession.Salts.Remove(DateTime.MaxValue);
+						_futureSaltsOperation = null;
+						_futureSaltsSession = null;
+					}
+			}
+		}
+
+		private static async Task<object> ObserveFutureSaltsResponseAsync(Rpc rpc, int dcId)
+		{
+			try
+			{
+				return await rpc.Task.ConfigureAwait(false);
+			}
+			catch (Exception ex)
+			{
+				// Keep observing the source task even if the connection cancels the caller's wait.
+				Helpers.Log(4, $"{dcId}>Could not receive future salts: {ex}");
+				return null;
+			}
 		}
 
 		internal MsgContainer ReadMsgContainer(BinaryReader reader)
@@ -910,7 +1037,9 @@ namespace WTelegram
 			}
 			else
 			{
-				endpoint = _dcSession?.EndPoint ?? GetDefaultEndpoint(out int defaultDc);
+				int defaultDc = 0;
+				endpoint = _dcSession?.EndPoint ?? GetDefaultEndpoint(out defaultDc);
+				if (defaultDc != 0 && (_dcSession?.DcID ?? 0) == 0) dcId = defaultDc;
 				Helpers.Log(2, $"Connecting to {endpoint}...");
 				TcpClient tcpClient = null;
 				try
@@ -971,11 +1100,12 @@ namespace WTelegram
 			_dcSession.Salts?.Remove(DateTime.MaxValue);
 			if (_networkStream != null)
 			{
-				byte protocolId = (byte)(_paddedMode ? 0xDD : 0xEE);
+				_abridgedMode = _session.ApiId is 4 or 6 && !_paddedMode;
+				byte protocolId = (byte)(_paddedMode ? 0xDD : _abridgedMode ? 0xEF : 0xEE);
 #if OBFUSCATION
 				(_sendCtr, _recvCtr, preamble) = InitObfuscation(secret, protocolId, dcId);
 #else
-				preamble = new byte[] { protocolId, protocolId, protocolId, protocolId };
+				preamble = _abridgedMode ? new byte[] { 0xEF } : new byte[] { protocolId, protocolId, protocolId, protocolId };
 #endif
 				await _networkStream.WriteAsync(preamble, 0, preamble.Length, _cts.Token);
 
@@ -986,14 +1116,27 @@ namespace WTelegram
 			try
 			{
 				if (_dcSession.authKeyID == 0)
-					await CreateAuthorizationKey(this, _dcSession);
+					await CreateAuthorizationKey(this, _dcSession, dcId);
 
 				if (_networkStream != null) _ = KeepAlive(_cts.Token);
-				if (quickResume && _dcSession.Layer == Layer.Version && _dcSession.DataCenter != null && _session.MainDC != 0)
+				if (quickResume && _dcSession.Layer == EffectiveLayer && _dcSession.DataCenter != null && _session.MainDC != 0)
 					TLConfig = new Config { this_dc = _session.MainDC, dc_options = _session.DcOptions };
+				else if (_deferInitConnectionOnCurrentDc && _session.DcOptions != null && _session.MainDC != 0)
+				{
+					TLConfig = new Config { this_dc = _session.MainDC, dc_options = _session.DcOptions };
+					if (_dcSession.DataCenter == null)
+					{
+						_dcSession.DataCenter = _session.DcOptions.Where(dc => dc.id == TLConfig.this_dc)
+							.OrderByDescending(dc => dc.ip_address == endpoint?.Address.ToString())
+							.ThenByDescending(dc => dc.port == endpoint?.Port)
+							.ThenByDescending(dc => dc.flags == (endpoint?.AddressFamily == AddressFamily.InterNetworkV6 ? DcOption.Flags.ipv6 : 0))
+							.First();
+						_session.DCSessions[TLConfig.this_dc] = _dcSession;
+					}
+				}
 				else
 				{
-					if (_dcSession.Layer != 0 && _dcSession.Layer != Layer.Version) _dcSession.Renew();
+					if (_dcSession.Layer != 0 && _dcSession.Layer != EffectiveLayer) _dcSession.Renew();
 					await InitConnection();
 					if (_dcSession.DataCenter == null)
 					{
@@ -1016,13 +1159,19 @@ namespace WTelegram
 			Helpers.Log(2, $"Connected to {(TLConfig.test_mode ? "Test DC" : "DC")} {TLConfig.this_dc}... {TLConfig.flags & (Config.Flags)~0x18E00U}");
 		}
 
-		private async Task InitConnection()
+		private bool _deferInitConnectionOnCurrentDc;
+		private int EffectiveLayer => _session.ApiId is 4 or 6 ? 232 : Layer.Version;
+
+		internal IMethod<T> WrapInLayerAndInitConnection<T>(IMethod<T> query, string initParamsJson = null)
 		{
-			var initParams = JSONValue.FromJsonElement(System.Text.Json.JsonDocument.Parse(Config("init_params")).RootElement);
-			TLConfig = await this.InvokeWithLayer(Layer.Version,
-				new TL.Methods.InitConnection<Config>
+			var json = initParamsJson ?? Config("init_params");
+			var initParams = JSONValue.FromJsonElement(System.Text.Json.JsonDocument.Parse(json).RootElement);
+			return new TL.Methods.InvokeWithLayer<T>
+			{
+				layer = EffectiveLayer,
+				query = new TL.Methods.InitConnection<T>
 				{
-					flags = TL.Methods.InitConnection<Config>.Flags.has_params,
+					flags = TL.Methods.InitConnection<T>.Flags.has_params,
 					api_id = _session.ApiId,
 					device_model = Config("device_model"),
 					system_version = Config("system_version"),
@@ -1031,19 +1180,113 @@ namespace WTelegram
 					lang_pack = Config("lang_pack"),
 					lang_code = Config("lang_code"),
 					params_ = initParams,
-					query = new TL.Methods.Help_GetConfig()
-				});
-			_dcSession.Layer = Layer.Version;
+					query = query
+				}
+			};
+		}
+
+		private sealed class AndroidLangpack_GetLanguages : IMethod<LangPackLanguage[]>
+		{
+			public void WriteTL(BinaryWriter writer) => writer.Write(0x800FD57DU);
+		}
+
+		private sealed class AndroidLangpack_GetLangPack : IMethod<LangPackDifference>
+		{
+			public string lang_code;
+			public void WriteTL(BinaryWriter writer)
+			{
+				writer.Write(0x9AB5C58EU);
+				writer.WriteTLValue(lang_code, typeof(string));
+			}
+		}
+
+		private sealed class AndroidLangpack_GetStrings : IMethod<LangPackStringBase[]>
+		{
+			public string lang_code;
+			public string[] keys;
+			public void WriteTL(BinaryWriter writer)
+			{
+				writer.Write(0x2E1EE318U);
+				writer.WriteTLValue(lang_code, typeof(string));
+				writer.WriteTLValue(keys, typeof(string[]));
+			}
+		}
+
+		private async Task InitConnection()
+		{
+			bool isAndroidColdStart = _session.MainDC == 0 && _session.UserId == 0 && _session.ApiId is 4 or 6;
+			var rawInitParams = Config("init_params");
+			var firstInitParams = isAndroidColdStart && rawInitParams.Contains("__NO_GOOGLE_PLAY_SERVICES__", StringComparison.Ordinal)
+				? rawInitParams.Replace("__NO_GOOGLE_PLAY_SERVICES__", $"__FIREBASE_GENERATING_SINCE_{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}__", StringComparison.Ordinal)
+				: rawInitParams;
+			TLConfig = await Invoke(WrapInLayerAndInitConnection(new TL.Methods.Help_GetConfig(), firstInitParams));
+			_dcSession.Layer = EffectiveLayer;
 			_session.DcOptions = TLConfig.dc_options;
+			if (isAndroidColdStart)
+			{
+				var continueLang = !string.IsNullOrEmpty(TLConfig.suggested_lang_code) ? TLConfig.suggested_lang_code : "en";
+				var uiLang = Config("lang_code");
+				if (string.IsNullOrEmpty(uiLang)) uiLang = "en";
+				try
+				{
+					await Invoke(WrapInLayerAndInitConnection(new AndroidLangpack_GetLanguages(), rawInitParams));
+					await Task.WhenAll(
+						Invoke(new AndroidLangpack_GetLangPack { lang_code = uiLang }),
+						Invoke(new AndroidLangpack_GetStrings { lang_code = continueLang, keys = ["ContinueOnThisLanguage"] }));
+				}
+				catch (Exception ex)
+				{
+					Helpers.Log(3, $"Android cold-start langpack warmup warning: {ex.Message}");
+				}
+			}
+		}
+
+		internal Task SendUnencryptedAckAsync(long msgId)
+			=> SendAsync(new MsgsAck { msg_ids = [msgId] }, false);
+
+		internal async Task BindTempAuthKeyAsync(long permAuthKeyId, byte[] permAuthKey, int expiresInSeconds, SHA1 sha1)
+		{
+			lock (_msgsToAck) _msgsToAck.Clear();
+			Span<byte> nonceBytes = stackalloc byte[8];
+			RNG.GetBytes(nonceBytes);
+			long nonce = BinaryPrimitives.ReadInt64LittleEndian(nonceBytes);
+			bool got503 = false;
+		retry:
+			var (msgId, seqno) = NewMsgId(true);
+			var expiresAt = DateTime.UtcNow + new TimeSpan(_dcSession.serverTicksOffset) + TimeSpan.FromSeconds(expiresInSeconds);
+			var encryptedMessage = CreateBindTempAuthKeyEncryptedMessage(
+				permAuthKeyId, permAuthKey, _dcSession.authKeyID, _dcSession.id, nonce, expiresAt, msgId, sha1);
+			var request = new TL.Methods.Auth_BindTempAuthKey
+			{
+				perm_auth_key_id = permAuthKeyId,
+				nonce = nonce,
+				expires_at = expiresAt,
+				encrypted_message = encryptedMessage
+			};
+			var rpc = new Rpc { type = typeof(bool) };
+			await SendAsync(request, true, rpc, forcedMsgId: msgId, forcedSeqno: seqno);
+			var result = await rpc.Task;
+			if (result is RpcError { error_code: -503 } && !got503)
+			{
+				got503 = true;
+				goto retry;
+			}
+			if (result is RpcError err)
+				throw new RpcException(err.error_code, err.error_message);
+			if (result is not true)
+				throw new WTException($"auth.bindTempAuthKey failed with {result}");
 		}
 
 		private async Task KeepAlive(CancellationToken ct)
 		{
-			int ping_id = _random.Next();
+			long ping_id = _session.ApiId is 4 or 6 ? 0 : _random.Next();
 			while (!ct.IsCancellationRequested)
 			{
-				await Task.Delay(Math.Abs(PingInterval) * 1000, ct);
-				if (PingInterval <= 0)
+				int intervalSec = _session.ApiId is 4 or 6 ? 19 : Math.Abs(PingInterval);
+				await Task.Delay(intervalSec * 1000, ct);
+				if (_session.ApiId is 4 or 6)
+					await this.PingDelayDisconnect(ping_id++, 35);
+				else if (PingInterval <= 0)
 					await this.Ping(ping_id++);
 				else // see https://core.telegram.org/api/optimisation#grouping-updates
 #if DEBUG
@@ -1193,11 +1436,30 @@ namespace WTelegram
 				User = null;
 			}
 			phone_number ??= Config("phone_number");
+			_apiHash ??= Config("api_hash");
+			if (_dcSession.authKeyID != 0 && _session.ApiId is 4 or 6)
+			{
+				try
+				{
+					if (_networkStream != null)
+						await Task.Delay(_random.Next(1500, 2400), _cts.Token);
+					await Task.WhenAll(
+						this.Help_GetNearestDc(),
+						this.Help_GetCountriesList(Config("lang_code"), 0),
+						this.Auth_InitPasskeyLogin(_session.ApiId, _apiHash));
+					if (_networkStream != null)
+						await Task.Delay(_random.Next(3600, 4800), _cts.Token);
+				}
+				catch (Exception ex) when (ex is not OperationCanceledException)
+				{
+					Helpers.Log(3, $"Android LoginActivity pre-login RPC warning: {ex.Message}");
+				}
+			}
 			Auth_SentCodeBase sentCodeBase;
 #pragma warning disable CS0618 // Auth_* methods are marked as obsolete
 			try
 			{
-				sentCodeBase = await this.Auth_SendCode(phone_number, _session.ApiId, _apiHash ??= Config("api_hash"), settings ??= new());
+				sentCodeBase = await this.Auth_SendCode(phone_number, _session.ApiId, _apiHash, settings ??= new());
 			}
 			catch (RpcException ex) when (ex.Code == 500 && ex.Message == "AUTH_RESTART")
 			{
@@ -1211,33 +1473,45 @@ namespace WTelegram
 				{
 					phone_code_hash = setupSentCode.phone_code_hash;
 					Helpers.Log(3, "A login email is required");
-					RaiseUpdates(sentCodeBase);
-					email = _config("email");
-					if (string.IsNullOrEmpty(email))
-						sentCodeBase = await this.Auth_ResendCode(phone_number, phone_code_hash);
-					else
+					for (int emailTry = 1; ; emailTry++)
 					{
-						var purpose = new EmailVerifyPurposeLoginSetup { phone_number = phone_number, phone_code_hash = phone_code_hash };
-						if (email is not "Google" and not "Apple")
+						RaiseUpdates(sentCodeBase);
+						email = _config("email");
+						if (string.IsNullOrEmpty(email))
 						{
-							var sentEmail = await this.Account_SendVerifyEmailCode(purpose, email);
-							Helpers.Log(3, "An email verification code has been sent to " + sentEmail.email_pattern);
-							RaiseUpdates(sentEmail);
+							sentCodeBase = await this.Auth_ResendCode(phone_number, phone_code_hash);
+							break;
 						}
-						Account_EmailVerified verified = null;
-						for (int retry = 1; verified == null; retry++)
-							try
+						try
+						{
+							var purpose = new EmailVerifyPurposeLoginSetup { phone_number = phone_number, phone_code_hash = phone_code_hash };
+							if (email is not "Google" and not "Apple")
 							{
-								var code = await ConfigAsync("email_verification_code");
-								verified = await this.Account_VerifyEmail(purpose, EmailVerification(email, code));
+								var sentEmail = await this.Account_SendVerifyEmailCode(purpose, email);
+								Helpers.Log(3, "An email verification code has been sent to " + sentEmail.email_pattern);
+								RaiseUpdates(sentEmail);
 							}
-							catch (RpcException e) when (e.Code == 400 && e.Message is "CODE_INVALID" or "EMAIL_TOKEN_INVALID")
-							{
-								Helpers.Log(4, "Wrong email verification code!");
-								if (retry >= MaxCodePwdAttempts) throw;
-							}
-						if (verified is Account_EmailVerifiedLogin verifiedLogin) // (it should always be)
-							sentCodeBase = verifiedLogin.sent_code;
+							Account_EmailVerified verified = null;
+							for (int retry = 1; verified == null; retry++)
+								try
+								{
+									var code = await ConfigAsync("email_verification_code");
+									verified = await this.Account_VerifyEmail(purpose, EmailVerification(email, code));
+								}
+								catch (RpcException e) when (e.Code == 400 && e.Message is "CODE_INVALID" or "EMAIL_TOKEN_INVALID")
+								{
+									Helpers.Log(4, "Wrong email verification code!");
+									if (retry >= MaxCodePwdAttempts) throw;
+								}
+							if (verified is Account_EmailVerifiedLogin verifiedLogin) // (it should always be)
+								sentCodeBase = verifiedLogin.sent_code;
+							break;
+						}
+						catch (RpcException e) when (e.Code == 400 && e.Message is "EMAIL_INVALID" or "EMAIL_NOT_ALLOWED")
+						{
+							Helpers.Log(4, $"Email rejected by Telegram ({e.Message}); please enter a different email!");
+							if (emailTry >= MaxCodePwdAttempts) throw;
+						}
 					}
 					RaiseUpdates(sentCodeBase);
 				}
@@ -1263,7 +1537,8 @@ namespace WTelegram
 							_ => false
 						}))
 						{
-							sentCodeBase = await this.Auth_ResendCode(phone_number, phone_code_hash);
+							sentCodeBase = await this.Auth_ResendCode(phone_number, phone_code_hash,
+								index > 0 && token[..index] == "reason" ? token[(index + 1)..] : null);
 							goto resent;
 						}
 					}
@@ -1445,40 +1720,50 @@ namespace WTelegram
 			return (msgId, seqno);
 		}
 
-		private async Task SendAsync(IObject msg, bool isContent, Rpc rpc = null)
+		private async Task SendAsync(IObject msg, bool isContent, Rpc rpc = null, CancellationToken connectionToken = default, long forcedMsgId = 0, int forcedSeqno = 0)
 		{
+			connectionToken.ThrowIfCancellationRequested();
 			if (_reactorTask == null) throw new WTException("You must connect to Telegram first");
 			isContent &= _dcSession.authKeyID != 0;
-			var (msgId, seqno) = NewMsgId(isContent);
+			var (msgId, seqno) = forcedMsgId != 0 ? (forcedMsgId, forcedSeqno) : NewMsgId(isContent);
 			if (rpc != null)
 				lock (_pendingRpcs)
 					_pendingRpcs[rpc.msgId = msgId] = rpc;
-			if (isContent)
+			if (isContent && forcedMsgId == 0)
 			{
-				List<_Message> messages = null;
-				if (_httpWait != null && NewMsgId(false) is var (hwId, hwSeqno))
-					(messages ??= []).Add(new(hwId, hwSeqno, _httpWait));
-				if (CheckMsgsToAck() is MsgsAck msgsAck && NewMsgId(false) is var (ackId, ackSeqno))
-					(messages ??= []).Add(new(ackId, ackSeqno, msgsAck));
-				if (messages != null)
+				if (_session.ApiId is 4 or 6 && _httpWait == null)
 				{
-					messages.Add(new(msgId, seqno, msg));
-					await SendAsync(new MsgContainer { messages = messages }, false);
-					return;
+					if (CheckMsgsToAck() is MsgsAck standaloneAck)
+						await SendAsync(standaloneAck, false, connectionToken: connectionToken);
+				}
+				else
+				{
+					List<_Message> messages = null;
+					if (_httpWait != null && NewMsgId(false) is var (hwId, hwSeqno))
+						(messages ??= []).Add(new(hwId, hwSeqno, _httpWait));
+					if (CheckMsgsToAck() is MsgsAck msgsAck && NewMsgId(false) is var (ackId, ackSeqno))
+						(messages ??= []).Add(new(ackId, ackSeqno, msgsAck));
+					if (messages != null)
+					{
+						messages.Add(new(msgId, seqno, msg));
+						await SendAsync(new MsgContainer { messages = messages }, false, connectionToken: connectionToken);
+						return;
+					}
 				}
 			}
 			Task receiveTask = null;
 			var sem = _sendSemaphore;
-			await sem.WaitAsync(_cts.Token);
+			await sem.WaitAsync(connectionToken.CanBeCanceled ? connectionToken : _cts.Token);
 			try
 			{
+				connectionToken.ThrowIfCancellationRequested();
 				using var memStream = new MemoryStream(1024);
 				using var writer = new BinaryWriter(memStream);
 				writer.Write(0);                // int32 payload_len (to be patched with payload length)
 
 				if (_dcSession.authKeyID == 0) // send unencrypted message
 				{
-					if (_bareRpc == null) throw new WTException($"Shouldn't send a {msg.GetType().Name} unencrypted");
+					if (_bareRpc == null && msg is not MsgsAck) throw new WTException($"Shouldn't send a {msg.GetType().Name} unencrypted");
 					writer.Write(0L);                       // int64 auth_key_id = 0 (Unencrypted)
 					writer.Write(msgId);                    // int64 message_id
 					writer.Write(0);                        // int32 message_data_length (to be patched)
@@ -1525,14 +1810,34 @@ namespace WTelegram
 				}
 				var buffer = memStream.GetBuffer();
 				int frameLength = (int)memStream.Length;
-				BinaryPrimitives.WriteInt32LittleEndian(buffer, frameLength - 4); // patch payload_len with correct value
+				int frameOffset = 0;
+				if (_abridgedMode && _networkStream != null)
+				{
+					int words = (frameLength - 4) >> 2;
+					if (words < 0x7F)
+					{
+						buffer[3] = (byte)words;
+						frameOffset = 3;
+					}
+					else
+					{
+						buffer[0] = 0x7F;
+						buffer[1] = (byte)words;
+						buffer[2] = (byte)(words >> 8);
+						buffer[3] = (byte)(words >> 16);
+					}
+				}
+				else
+				{
+					BinaryPrimitives.WriteInt32LittleEndian(buffer, frameLength - 4); // patch payload_len with correct value
+				}
 #if OBFUSCATION
-				_sendCtr?.EncryptDecrypt(buffer.AsSpan(0, frameLength));
+				_sendCtr?.EncryptDecrypt(buffer.AsSpan(frameOffset, frameLength - frameOffset));
 #endif
 				if (_networkStream != null)
-					await _networkStream.WriteAsync(buffer, 0, frameLength);
+					await _networkStream.WriteAsync(buffer, frameOffset, frameLength - frameOffset, connectionToken);
 				else
-					receiveTask = SendReceiveHttp(buffer, frameLength);
+					receiveTask = SendReceiveHttp(buffer, frameLength, connectionToken);
 				_lastSentMsg = msg;
 			}
 			finally
@@ -1542,14 +1847,16 @@ namespace WTelegram
 			if (receiveTask != null) await receiveTask;
 		}
 
-		private async Task SendReceiveHttp(byte[] buffer, int frameLength)
+		private async Task SendReceiveHttp(byte[] buffer, int frameLength, CancellationToken connectionToken = default)
 		{
+			connectionToken.ThrowIfCancellationRequested();
 			var endpoint = _dcSession?.EndPoint ?? GetDefaultEndpoint(out _);
 			var content = new ByteArrayContent(buffer, 4, frameLength - 4);
-			var response = await _httpClient.PostAsync($"http://{endpoint}/api", content, _cts.Token);
+			var response = await _httpClient.PostAsync($"http://{endpoint}/api", content, connectionToken.CanBeCanceled ? connectionToken : _cts.Token);
 			if (response.StatusCode != HttpStatusCode.OK)
 				throw new RpcException((int)response.StatusCode, TransportError((int)response.StatusCode));
-			var data = await response.Content.ReadAsByteArrayAsync();
+			var data = await response.Content.ReadAsByteArrayAsync(connectionToken);
+			connectionToken.ThrowIfCancellationRequested();
 			var obj = ReadFrame(data, data.Length);
 			if (obj != null)
 				await HandleMessageAsync(obj);
@@ -1558,15 +1865,18 @@ namespace WTelegram
 		/// <summary>Long poll on HTTP connections</summary>
 		/// <param name="httpWait">Parameters for the long poll. Leave <see langword="null"/> for the default 25 seconds.</param>
 		/// <remarks>⚠️ Telegram servers don't seem to support other parameter than <see langword="null"/> correctly</remarks>
-		public async Task HttpWait(HttpWait httpWait = null)
+		public Task HttpWait(HttpWait httpWait = null) => HttpWaitAsync(httpWait, default);
+
+		private async Task HttpWaitAsync(HttpWait httpWait, CancellationToken connectionToken)
 		{
+			connectionToken.ThrowIfCancellationRequested();
 			if (_networkStream != null) throw new InvalidOperationException("Can't use HttpWait over TCP connection");
 			var container = new MsgContainer { messages = [] };
 			if (httpWait != null && NewMsgId(false) is var (hwId, hwSeqno))
 				container.messages.Add(new(hwId, hwSeqno, httpWait));
 			if (CheckMsgsToAck() is MsgsAck msgsAck && NewMsgId(false) is var (ackId, ackSeqno))
 				container.messages.Add(new(ackId, ackSeqno, msgsAck));
-			await SendAsync(container, false);
+			await SendAsync(container, false, connectionToken: connectionToken);
 		}
 
 		internal async Task<T> InvokeBare<T>(IMethod<T> request)
@@ -1590,8 +1900,15 @@ namespace WTelegram
 				query = new TL.Methods.InvokeWithoutUpdates<T> { query = query };
 			bool got503 = false;
 		retry:
+			var wireQuery = query;
+			bool wrappedInInitConnection = false;
+			if (_deferInitConnectionOnCurrentDc && query is not IMethod<Pong> and not IMethod<FutureSalts> and not TL.Methods.InvokeWithLayer<T>)
+			{
+				wireQuery = WrapInLayerAndInitConnection(query);
+				wrappedInInitConnection = true;
+			}
 			var rpc = new Rpc { type = typeof(T) };
-			await SendAsync(query, true, rpc);
+			await SendAsync(wireQuery, true, rpc);
 			while (_httpClient != null && !rpc.Task.IsCompleted)
 				await HttpWait(_httpWait); // need to wait a bit more in some case
 
@@ -1599,18 +1916,17 @@ namespace WTelegram
 			switch (result)
 			{
 				case null: return default;
-				case T resultT: return resultT;
+				case T resultT:
+					if (wrappedInInitConnection && _deferInitConnectionOnCurrentDc)
+					{
+						_deferInitConnectionOnCurrentDc = false;
+						_dcSession.Layer = EffectiveLayer;
+						lock (_session) _session.Save();
+					}
+					return resultT;
 				case RpcError { error_code: var code, error_message: var message }:
-					int x = -1;
-					for (int index = message.Length - 1; index > 0 && (index = message.LastIndexOf('_', index - 1)) >= 0;)
-						if (message[index + 1] is >= '0' and <= '9')
-						{
-							int end = ++index;
-							do end++; while (end < message.Length && message[end] is >= '0' and <= '9');
-							x = int.Parse(message[index..end]);
-							message = $"{message[0..index]}X{message[end..]}";
-							break;
-						}
+					int x;
+					(message, x) = NormalizeRpcError(message);
 
 					if (code == 303 && message.EndsWith("_MIGRATE_X"))
 					{
@@ -1665,6 +1981,24 @@ namespace WTelegram
 			}
 		}
 
+		private static (string Message, int X) NormalizeRpcError(string message)
+		{
+			// The action, site key, and integrity nonce are opaque challenge data, not numeric RPC error parameters.
+			if (message.StartsWith("RECAPTCHA_CHECK_", StringComparison.Ordinal)
+				|| message.StartsWith("INTEGRITY_CHECK_", StringComparison.Ordinal)) return (message, -1);
+			int x = -1;
+			for (int index = message.Length - 1; index > 0 && (index = message.LastIndexOf('_', index - 1)) >= 0;)
+				if (message[index + 1] is >= '0' and <= '9')
+				{
+					int end = ++index;
+					do end++; while (end < message.Length && message[end] is >= '0' and <= '9');
+					x = int.Parse(message[index..end]);
+					message = $"{message[0..index]}X{message[end..]}";
+					break;
+				}
+			return (message, x);
+		}
+
 		private async Task MigrateToDC(int dcId)
 		{
 			// this is a hack to migrate _dcSession in-place (staying in same Client):
@@ -1676,6 +2010,7 @@ namespace WTelegram
 			_dcSession.Client = null;
 			_dcSession = dcSession;
 			_dcSession.Client = this;
+			_deferInitConnectionOnCurrentDc = _session.UserId == 0 && _session.ApiId is 4 or 6;
 			await ConnectAsync();
 		}
 

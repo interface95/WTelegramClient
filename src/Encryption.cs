@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
@@ -26,15 +26,42 @@ namespace WTelegram
 			if (AesECB.BlockSize != 128) throw new WTException("AES Blocksize is not 16 bytes");
 		}
 
-		internal static async Task CreateAuthorizationKey(Client client, Session.DCSession session)
+		internal static async Task CreateAuthorizationKey(Client client, Session.DCSession session, int defaultDcId = 0)
 		{
 			if (PublicKeys.Count == 0) LoadDefaultPublicKeys();
-			var sha1 = SHA1.Create();
-			var sha256 = SHA256.Create();
+			using var sha1 = SHA1.Create();
+			using var sha256 = SHA256.Create();
+			bool useAndroidPfs = client.ApiId is 4 or 6 && session.DataCenter?.flags.HasFlag(DcOption.Flags.cdn) != true;
+			int dcId = session.DataCenter?.id ?? (defaultDcId != 0 ? defaultDcId : 2);
 
+			var (permKeyId, permKey, permSalt) = await NegotiateDhKeyAsync(client, session, sha1, sha256, dcId, expiresIn: 0, sendDhAcks: useAndroidPfs);
+			if (!useAndroidPfs)
+			{
+				session.authKeyID = permKeyId;
+				session.AuthKey = permKey;
+				session.Salt = permSalt;
+				session.OldSalt = permSalt;
+				return;
+			}
+
+			const int TempAuthKeyExpireTime = 86400;
+			var (tempKeyId, tempKey, tempSalt) = await NegotiateDhKeyAsync(client, session, sha1, sha256, dcId, expiresIn: TempAuthKeyExpireTime, sendDhAcks: true);
+			session.authKeyID = tempKeyId;
+			session.AuthKey = tempKey;
+			session.Salt = tempSalt;
+			session.OldSalt = tempSalt;
+			session.lastSentMsgId = 0;
+			session.seqno = 0;
+			await client.BindTempAuthKeyAsync(permKeyId, permKey, TempAuthKeyExpireTime, sha1);
+		}
+
+		private static async Task<(long authKeyId, byte[] authKey, long salt)> NegotiateDhKeyAsync(
+			Client client, Session.DCSession session, SHA1 sha1, SHA256 sha256, int dcId, int expiresIn, bool sendDhAcks)
+		{
 			//1)
 			var nonce = new TL.Int128(RNG);
 			var resPQ = await client.ReqPqMulti(nonce);
+			long resPqMsgId = client.LastRecvMsgId;
 			//2)
 			if (resPQ.nonce != nonce) throw new WTException("Nonce mismatch");
 			var fingerprint = resPQ.server_public_key_fingerprints.FirstOrDefault(PublicKeys.ContainsKey);
@@ -47,18 +74,34 @@ namespace WTelegram
 			ulong p = Helpers.PQFactorize(pq);
 			ulong q = pq / p;
 			//4)
-			var pqInnerData = new PQInnerDataDc
-			{
-				pq = resPQ.pq,
-				p = Helpers.ToBigEndian(p),
-				q = Helpers.ToBigEndian(q),
-				nonce = nonce,
-				server_nonce = resPQ.server_nonce,
-				new_nonce = new Int256(RNG),
-				dc = session.DataCenter?.id ?? 0
-			};
-			if (client.TLConfig?.test_mode == true) pqInnerData.dc += 10000;
-			if (session.DataCenter?.flags.HasFlag(DcOption.Flags.media_only) == true) pqInnerData.dc = -pqInnerData.dc;
+			int targetDc = dcId;
+			if (client.TLConfig?.test_mode == true) targetDc += 10000;
+			if (session.DataCenter?.flags.HasFlag(DcOption.Flags.media_only) == true) targetDc = -targetDc;
+			var pBytes = Helpers.ToBigEndian(p);
+			var qBytes = Helpers.ToBigEndian(q);
+			var newNonce = new Int256(RNG);
+			PQInnerData pqInnerData = expiresIn > 0
+				? new PQInnerDataTempDc
+				{
+					pq = resPQ.pq,
+					p = pBytes,
+					q = qBytes,
+					nonce = nonce,
+					server_nonce = resPQ.server_nonce,
+					new_nonce = newNonce,
+					dc = targetDc,
+					expires_in = expiresIn
+				}
+				: new PQInnerDataDc
+				{
+					pq = resPQ.pq,
+					p = pBytes,
+					q = qBytes,
+					nonce = nonce,
+					server_nonce = resPQ.server_nonce,
+					new_nonce = newNonce,
+					dc = targetDc
+				};
 			byte[] encrypted_data = null;
 			{
 				//4.1) RSA_PAD(data, server_public_key)
@@ -88,7 +131,10 @@ namespace WTelegram
 						encrypted_data = BigInteger.ModPow(x, BigEndianInteger(publicKey.e), n).To256Bytes();
 				} while (encrypted_data == null); // otherwise, repeat the steps
 			}
+			if (sendDhAcks && resPqMsgId != 0)
+				await client.SendUnencryptedAckAsync(resPqMsgId);
 			var serverDHparams = await client.ReqDHParams(pqInnerData.nonce, pqInnerData.server_nonce, pqInnerData.p, pqInnerData.q, fingerprint, encrypted_data);
+			long serverDhMsgId = client.LastRecvMsgId;
 			//5)
 			var localTime = DateTimeOffset.UtcNow;
 			if (serverDHparams is not ServerDHParamsOk serverDHparamsOk) throw new WTException("not server_DH_params_ok");
@@ -141,7 +187,10 @@ namespace WTelegram
 
 				encrypted_data = AES_IGE_EncryptDecrypt(clearBuffer.AsSpan(0, clearLength + paddingToAdd), tmp_aes_key, tmp_aes_iv, true);
 			}
+			if (sendDhAcks && serverDhMsgId != 0)
+				await client.SendUnencryptedAckAsync(serverDhMsgId);
 			var setClientDHparamsAnswer = await client.SetClientDHParams(clientDHinnerData.nonce, clientDHinnerData.server_nonce, encrypted_data);
+			long dhGenMsgId = client.LastRecvMsgId;
 			//7)
 			var gab = BigInteger.ModPow(g_a, b, dh_prime);
 			var authKey = gab.ToByteArray(true, true);
@@ -152,6 +201,8 @@ namespace WTelegram
 			if (setClientDHparamsAnswer is not DhGenOk dhGenOk) throw new WTException("not dh_gen_ok");
 			if (dhGenOk.nonce != nonce) throw new WTException("Nonce mismatch");
 			if (dhGenOk.server_nonce != resPQ.server_nonce) throw new WTException("Server Nonce mismatch");
+			if (sendDhAcks && dhGenMsgId != 0)
+				await client.SendUnencryptedAckAsync(dhGenMsgId);
 			var expected_new_nonceN = new byte[32 + 1 + 8];
 			pqInnerData.new_nonce.raw.CopyTo(expected_new_nonceN, 0);
 			expected_new_nonceN[32] = 1;
@@ -159,10 +210,80 @@ namespace WTelegram
 			if (!Enumerable.SequenceEqual(dhGenOk.new_nonce_hash1.raw, sha1.ComputeHash(expected_new_nonceN).Skip(4)))
 				throw new WTException("setClientDHparamsAnswer.new_nonce_hashN mismatch");
 
-			session.authKeyID = BinaryPrimitives.ReadInt64LittleEndian(authKeyHash.AsSpan(12));
-			session.AuthKey = authKey;
-			session.Salt = BinaryPrimitives.ReadInt64LittleEndian(pqInnerData.new_nonce.raw) ^ BinaryPrimitives.ReadInt64LittleEndian(resPQ.server_nonce.raw);
-			session.OldSalt = session.Salt;
+			var authKeyId = BinaryPrimitives.ReadInt64LittleEndian(authKeyHash.AsSpan(12));
+			var serverSalt = BinaryPrimitives.ReadInt64LittleEndian(pqInnerData.new_nonce.raw) ^ BinaryPrimitives.ReadInt64LittleEndian(resPQ.server_nonce.raw);
+			return (authKeyId, authKey, serverSalt);
+		}
+
+		internal static byte[] CreateBindTempAuthKeyEncryptedMessage(
+			long permAuthKeyId, byte[] permAuthKey, long tempAuthKeyId, long tempSessionId,
+			long nonce, DateTime expiresAt, long outerMsgId, SHA1 sha1)
+		{
+			var inner = new BindAuthKeyInner
+			{
+				nonce = nonce,
+				temp_auth_key_id = tempAuthKeyId,
+				perm_auth_key_id = permAuthKeyId,
+				temp_session_id = tempSessionId,
+				expires_at = expiresAt
+			};
+			using var innerStream = new MemoryStream(64);
+			using (var innerWriter = new BinaryWriter(innerStream, Encoding.UTF8, leaveOpen: true))
+				innerWriter.WriteTLObject(inner);
+			int messageSize = (int)innerStream.Length; // 40 bytes
+			int additionalSize = (16 - ((32 + messageSize) % 16)) % 16; // 8 bytes
+			int plainLen = 32 + messageSize + additionalSize; // 80 bytes
+			var plain = new byte[plainLen];
+			RNG.GetBytes(plain, 0, 16); // random salt (8B) + random session_id (8B)
+			BinaryPrimitives.WriteInt64LittleEndian(plain.AsSpan(16, 8), outerMsgId);
+			BinaryPrimitives.WriteInt32LittleEndian(plain.AsSpan(24, 4), 0); // seqno = 0
+			BinaryPrimitives.WriteInt32LittleEndian(plain.AsSpan(28, 4), messageSize);
+			Buffer.BlockCopy(innerStream.GetBuffer(), 0, plain, 32, messageSize);
+			if (additionalSize > 0)
+				RNG.GetBytes(plain, 32 + messageSize, additionalSize);
+
+			var msgKeySha1 = sha1.ComputeHash(plain, 0, 32 + messageSize);
+			var msgKey = new byte[16];
+			Buffer.BlockCopy(msgKeySha1, 4, msgKey, 0, 16);
+
+			var block = new byte[48];
+			var aesKey = new byte[32];
+			var aesIv = new byte[32];
+
+			// sha1_a = SHA1(msg_key + auth_key[0..32])
+			Buffer.BlockCopy(msgKey, 0, block, 0, 16);
+			Buffer.BlockCopy(permAuthKey, 0, block, 16, 32);
+			var sha1A = sha1.ComputeHash(block, 0, 48);
+			Buffer.BlockCopy(sha1A, 0, aesKey, 0, 8);
+			Buffer.BlockCopy(sha1A, 8, aesIv, 0, 12);
+
+			// sha1_b = SHA1(auth_key[32..48] + msg_key + auth_key[48..64])
+			Buffer.BlockCopy(permAuthKey, 32, block, 0, 16);
+			Buffer.BlockCopy(msgKey, 0, block, 16, 16);
+			Buffer.BlockCopy(permAuthKey, 48, block, 32, 16);
+			var sha1B = sha1.ComputeHash(block, 0, 48);
+			Buffer.BlockCopy(sha1B, 8, aesKey, 8, 12);
+			Buffer.BlockCopy(sha1B, 0, aesIv, 12, 8);
+
+			// sha1_c = SHA1(auth_key[64..96] + msg_key)
+			Buffer.BlockCopy(permAuthKey, 64, block, 0, 32);
+			Buffer.BlockCopy(msgKey, 0, block, 32, 16);
+			var sha1C = sha1.ComputeHash(block, 0, 48);
+			Buffer.BlockCopy(sha1C, 4, aesKey, 20, 12);
+			Buffer.BlockCopy(sha1C, 16, aesIv, 20, 4);
+
+			// sha1_d = SHA1(msg_key + auth_key[96..128])
+			Buffer.BlockCopy(msgKey, 0, block, 0, 16);
+			Buffer.BlockCopy(permAuthKey, 96, block, 16, 32);
+			var sha1D = sha1.ComputeHash(block, 0, 48);
+			Buffer.BlockCopy(sha1D, 0, aesIv, 24, 8);
+
+			var encryptedPlain = AES_IGE_EncryptDecrypt(plain, aesKey, aesIv, true);
+			var result = new byte[24 + encryptedPlain.Length];
+			BinaryPrimitives.WriteInt64LittleEndian(result.AsSpan(0, 8), permAuthKeyId);
+			Buffer.BlockCopy(msgKey, 0, result, 8, 16);
+			Buffer.BlockCopy(encryptedPlain, 0, result, 24, encryptedPlain.Length);
+			return result;
 		}
 
 		public static (byte[] key, byte[] iv) ConstructTmpAESKeyIV(SHA1 sha1, TL.Int128 server_nonce, Int256 new_nonce)
@@ -347,13 +468,16 @@ j4WcDuXc2CTHgH8gFTNhp/Y8/SpDOhvn9QIDAQAB
 		{
 			byte[] preamble = new byte[64];
 			do
-				RNG.GetBytes(preamble, 0, 58);
+				RNG.GetBytes(preamble, 0, 64);
 			while (preamble[0] == 0xef ||
 				BinaryPrimitives.ReadUInt32LittleEndian(preamble) is 0x44414548 or 0x54534f50 or 0x20544547 or 0x4954504f or 0x02010316 or 0xdddddddd or 0xeeeeeeee ||
 				BinaryPrimitives.ReadInt32LittleEndian(preamble.AsSpan(4)) == 0);
-			preamble[62] = preamble[56];  preamble[63] = preamble[57];
 			preamble[56] = preamble[57] = preamble[58] = preamble[59] = protocolId;
-			preamble[60] = (byte)dcId; preamble[61] = (byte)(dcId >> 8);
+			if (protocolId != 0xEF || secret != null)
+			{
+				preamble[60] = (byte)dcId;
+				preamble[61] = (byte)(dcId >> 8);
+			}
 
 			byte[] recvKey = preamble[8..40], recvIV = preamble[40..56];
 			Array.Reverse(preamble, 8, 48);
